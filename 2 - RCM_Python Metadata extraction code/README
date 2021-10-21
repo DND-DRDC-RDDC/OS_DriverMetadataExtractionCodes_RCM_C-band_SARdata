@@ -1,0 +1,8 @@
+This package was developed by Defence Research and Development Canada (DRDC) Ottawa Research Centre, in 2021.
+It contains RCM Python Raster driver, which extracts RCM metadata and calculates calibrated values such as Sigma0.
+  
+Files are:
+  RCMLayer.py
+  DopplerCentroid.py
+  OrbitCalculator.py
+  SlantRangeCalculator.py
