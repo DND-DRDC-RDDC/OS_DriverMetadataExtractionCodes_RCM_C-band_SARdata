@@ -1,0 +1,5 @@
+GDAL C++ code:
+- GDAL license: https://gdal.org/license.html
+
+Python metadata extraction code:
+- SPDX Python License 2.0
