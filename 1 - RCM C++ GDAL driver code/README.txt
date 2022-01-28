@@ -41,4 +41,4 @@ Files in this package:
   gdal-2.4.4\gcore\gdalarraybandblockcache.cpp  one change made in AdoptBlock()
   
 The Linux user is required to edit the following file which comes with GDAL:
-gdal-2.4.4\GDALmake.opt:                after running the command ./configure, add a line 'GDAL_FORMATS += rcm' towards the end of the file, following all the other lines of GDAL_FORMATS statements
+gdal-2.4.4\GDALmake.opt                 after running the command ./configure, add a line 'GDAL_FORMATS += rcm' towards the end of the file, following all the other lines of GDAL_FORMATS statements
