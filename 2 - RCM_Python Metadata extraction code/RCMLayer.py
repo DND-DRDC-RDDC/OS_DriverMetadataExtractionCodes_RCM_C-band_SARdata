@@ -1,6 +1,6 @@
 #------------------------------------------------------------------------------
 # Copyright (c) Her majesty the Queen in right of Canada as represented
-# by the Minister of National Defence, 2021.
+# by the Minister of National Defence, 2018.
 #------------------------------------------------------------------------------
 
 # ***********************************************************************************************
@@ -10,7 +10,10 @@
 # Shawn Gong, MDA          1.1          Feb 2019            SigmaNoughtLUT(offset, gains), SigmaNoughtNoise, are per band
 # Shawn Gong, MDA          1.2          summer 2020         extract azimuth noise
 # Shawn Gong, MDA          1.3          Dec 2020            remove CIS's dependency
-# Shawn Gong, MDA          1.31         Oct 2021            for GitHub release
+# Shawn Gong, MDA          1.4          April 2021          add ScanSAR burstmap
+# Shawn Gong, MDA          1.41         May 2021            noise azimuth_scaling
+# Shawn Gong, MDA          1.5          May 2022            add MLC support
+# Shawn Gong, MDA          1.51         May 2022            fix a bug in __applyLUT()
 #
 # http://www.asc-csa.gc.ca/eng/satellites/radarsat/radarsat-tableau.asp
 # ***********************************************************************************************
@@ -22,26 +25,31 @@ import datetime
 import numpy
 import scipy.constants
 from xml.etree import ElementTree as ET
-import DopplerCentroid as DC
-from SlantRangeCalculator import SlantRangeCalculator, GroundToSlantRangeEntry
-from OrbitCalculator import OrbitCalculator, OrbitStateVector
+from SARLayer import SARLayer, UnknownProductTypeException, NotInZeroDopplerCoordsException
+from RasterLayer import register
+import SAR.DopplerCentroid as DC
+from SAR.SlantRangeCalculator import SlantRangeCalculator, GroundToSlantRangeEntry
+from SAR.OrbitCalculator import OrbitCalculator, OrbitStateVector
+import gvutils
+import ATD_Utils
 from bisect import bisect
 from operator import add
-from osgeo import gdal
-
 
 SCHEMA = "{rcmGsProductSchema}"
+RCM_PREFIX = 'RCM: '
+GDAL_DRIVER_SHORT_NAME = 'RCM'
 
-#regular expression for parsing the dates in product.xml.  The decimal part of the seconds field is optional
-#after re.match, the output tuple will be year, month, day, hour, minute, integerSecond, decimalSeconds
+# regular expression for parsing the dates in product.xml.  The decimal part of the seconds field is optional
+# after re.match, the output tuple will be year, month, day, hour, minute, integerSecond, decimalSeconds
 RCM_DATE_FORMAT = '(\d+)-(\d+)-(\d+)T(\d+):(\d+):(\d+)(\.\d+)?Z'
 
 # RCM orbit constants
 # RCM inclination angle is 97.74, = the angle between the equatorial plane and the
 # satellite orbit in the counter-clockwise direction.
 # Degrees from north in the clockwise direction = 360-7.74
-ORBIT_INC  = 97.74
+ORBIT_INCLINATION  = 97.74
 ORBIT_RATE = 2*math.pi*179/(12*24*60*60)    # rad/s   repeat cycle of 179 orbits in 12 days
+ORBIT_DURATION = 96.4       # mins
 
 # following resolutions are from RCM Product Description RCM-SP-52-9092, issue 1/11, 08-JAN-2018
 # BEAM_PARAMS tuple is (resolution, non-slc number of looks, non-slc number of looks for Dual HH-VV)
@@ -61,11 +69,12 @@ BEAM_PARAMS = {
 
 # various product types
 PRODUCT_TYPES = {#tuple (inZeroDopplerCoords, inSlantRange, isDetected)
-                 'SLC': (True,  True,  False), # single-look complex
+                 'SLC': (True,  True,  False), # Single-Look Complex
                  'GRD': (True,  False, True),  # Ground range georeferenced Detected
                  'GRC': (True,  False, False), # Ground range georeferenced Complex
                  'GCD': (False, False, True),  # GeoCoded Detected
-                 'GCC': (False, False, False)  # GeoCoded Complex
+                 'GCC': (False, False, False), # GeoCoded Complex
+                 'MLC': (True,  True,  False)  # Multi-Look Complex (Mixed: UInt16 for detected image, CInt16 for complex I&Q band; or Float32 for detected image, Float32 for complex I&Q band)
                  }
 
 IN_ZERO_DOPPLER_COORDS = 0      # first column
@@ -73,20 +82,20 @@ IN_SLANT_RANGE = 1              # second column
 IS_DETECTED = 2                 # third column
 
 
-class UnknownProductTypeException(Exception):pass
-class NotInZeroDopplerCoordsException(Exception):pass
+class RCMLayer(SARLayer):
+    # flag to specify that a type search should not be performed when instantiating new RCMLayer
+    TYPE_SEARCH = False
 
-class RCMLayer():
-    TYPE_SEARCH = False  #flag to specify that a type search should not be performed when instantiating new RCMLayer
-    def __init__(self, xml_filename):
-        #SARLayer.__init__(self, *args, **kwargs)
+    def __init__(self, *args, **kwargs):
+        SARLayer.__init__(self, *args, **kwargs)
         
-        self._ds = gdal.Open(xml_filename)
-        self.filename = xml_filename
-        self.productPath, basename = os.path.split(self.filename)
+        self.set_name(RCM_PREFIX + self.get_filename(vrtOriginalFilename=True))
+        self.productPath, filename = os.path.split(self.get_filename())
 
+        #try:    #don't fail just because metadata has problems
         self._getXmlLines()
         self._readMetaData()
+        self._setDisplayInfo()
         
         self.readBurstAttributes()
         self.getSigmaNoughtNoiseParams()        # this is needed to populate self.sigmaNoughtNoiseParams
@@ -94,9 +103,12 @@ class RCMLayer():
             self._calcIncAngles()
         
         # single-file NITF needs to open the .ntf
-#        if basename == 'product.xml' and self.imageFiles[0].lower().endswith('.ntf'):
-#            print("Warning: RCM single-file NITF image")
+#        if filename == 'product.xml' and self.imageFiles[0].lower().endswith('.ntf'):
+#            gvutils.warning('RCM single-file NITF image: please close this product.xml and open '+self.imageFiles[0])
         
+        #except:
+        #    print 'Warning: Failed to read some metadata for %s' % self.get_filename()
+    
     def get_filename(self, vrtOriginalFilename=False, removeCalibrationDirective=False):
         f = super(RCMLayer, self).get_filename(vrtOriginalFilename)
         
@@ -107,7 +119,7 @@ class RCMLayer():
         return f
     
     def _getXmlLines(self):
-        
+        self.filename = self.get_filename(vrtOriginalFilename=True, removeCalibrationDirective=True)
         with open(self.filename) as fd:
             self.xmlLines = fd.read()
         return self.xmlLines
@@ -137,7 +149,7 @@ class RCMLayer():
         '''Reads metadata from product.xml and sets the corresponding variables'''
         
         if '_GCC' in self.filename or '_GCD' in self.filename:
-            print("Warning: RCM geocoded product is not supported in IA Pro.\n It is for display purpose only!")
+            gvutils.warning("RCM geocoded product is not supported in IA Pro.\n It is for display purpose only!")
             self.geocoded = True
         else:
             self.geocoded = False
@@ -145,7 +157,7 @@ class RCMLayer():
         root = ET.fromstring(self.xmlLines)
         
         if int([i.text for i in next(root.iter(SCHEMA + "sceneAttributes")).findall(".//" + SCHEMA + "numberOfEntries")][0]) > 1:
-            print("Error: RCM ScanSAR SLC image chips need to be stitched together!")
+            gvutils.error("RCM ScanSAR SLC image chips need to be stitched together!")
             return
         
         self.productID = [i.text for i in root.iter(SCHEMA + "productId")][0]           # the same image will be given different productId for different user
@@ -155,8 +167,8 @@ class RCMLayer():
         self.month = self.datetimestr[5:7]
         self.datetime = self.__datetime_from_string(self.datetimestr)
         self.sensorString = [i.text for i in root.iter(SCHEMA + "satellite")][0]
-        self.beamMode = [i.text for i in root.iter(SCHEMA + "beamMode")][0]
-        self.beamModeMnemonic = [i.text for i in root.iter(SCHEMA + "beamModeMnemonic")][0]
+        self.beamMode = [i.text for i in root.iter(SCHEMA + "beamMode")][0]                     # i.e. 'Ship Detection'
+        self.beamModeMnemonic = [i.text for i in root.iter(SCHEMA + "beamModeMnemonic")][0]     # i.e. 'SCSDA'
         self.freqBandStr = "C-band"
         self.acquisitionType = [i.text for i in root.iter(SCHEMA + "acquisitionType")][0]
         self.dataType = [i.text for i in root.iter(SCHEMA + "sampleType")][0]
@@ -245,8 +257,19 @@ class RCMLayer():
                 if node.attrib['beam'] not in self.PRF:   # take the first PRF value per beam
                     self.PRF[node.attrib['beam']] = float([i.text for i in node.iter(SCHEMA + "pulseRepetitionFrequency")][0])
         
+        # this is copied from RADARSAT2Layer.py, without this RCM NITF getBandLabel() won't work
+        #hack: since the vrt contains very little metadata, we always have to go back to the original dataset (not sure what the point of a VRT is anyways)
+        #now we need to know which label goes with each band.  The GDAL driver takes the info from the product.xml tags fullResolutionImageData
+        #the band numbers should be in the same order as the tags - extract the pol and add to metadata
+        for idx, pol in enumerate(self.pols):
+            if self.isVRT():    # RCM NITF
+                try:            # check if the data exists
+                    self._ds.GetRasterBand(idx+1).GetMetadata()['POLARIMETRIC_INTERP']
+                except:         # if not, write it
+                    self._ds.GetRasterBand(idx+1).SetMetadataItem('POLARIMETRIC_INTERP', pol)
+
         #add the pol as the band description so OpenEV will use it in the raster properties dialog
-        #TODO: it might be better to edit the GDAL driver to set the band description     
+        #TODO: it might be better to edit the GDAL driver to set the band description
         try:
             for idx in range(self._ds.RasterCount):
                 self._ds.GetRasterBand(idx+1).SetDescription(self._ds.GetRasterBand(idx+1).GetMetadata()['POLARIMETRIC_INTERP'])
@@ -265,6 +288,38 @@ class RCMLayer():
     def _imageRawEndTime(self):
         return self.zeroDopplerTimeLastLineStr
 
+    def _setDisplayInfo(self):
+        '''Updates the values in the self.displayInfo dictionary.'''
+        
+        self.displayInfo['Sensor'] = self.sensorString
+        self.displayInfo['Acquisition Date'] = self.datetime.strftime("%d-%b-%Y %H:%M:%S UTC")
+        self.displayInfo['Frequency'] = self.freqBandStr
+        self.displayInfo['Polarization'] = self.polarizations
+        self.displayInfo['Beam Mode'] = self.beamMode + ' (' + self.beamModeMnemonic + ')'    # i.e. Ship Detection (SCSDA)
+        self.displayInfo['ASC_DES'] = self.passDirection.capitalize()
+        self.displayInfo['Incidence Angle'] = str(round(float(self.incAngleNear), 1)) + ' (Near), ' + \
+                                              str(round(float(self.incAngleFar ), 1)) + ' (Far)'
+        
+        self.displayInfo['Resolution'] = BEAM_PARAMS[self.beamMode][0]
+        if self.isComplex:
+            self.displayInfo['Number of Looks'] = '1 x 1'
+        else:
+            self.displayInfo['Number of Looks'] = BEAM_PARAMS[self.beamMode][1]
+            if self.polarizations == "HH VV" and self.beamMode in ['Medium Resolution 30m', 'Medium Resolution 16m']:
+                self.displayInfo['Number of Looks'] = BEAM_PARAMS[self.beamMode][2]
+        
+        if not self.geocoded:
+            self.displayInfo['SatelliteHeading'] = self.getTrackAngle()
+
+            self.displayInfo['Antenna_Pointing'] = self.lookDirection
+            if self.lookDirection.lower() == "left":
+                self.displayInfo['SensorLookDirection'] = math.fmod(self.displayInfo['SatelliteHeading'] - 90.0, 360.)
+            else:
+                self.displayInfo['SensorLookDirection'] = math.fmod(self.displayInfo['SatelliteHeading'] + 90.0, 360.)
+            
+            self.displayInfo['ProcessingElevation'] = self.processingElevation
+            self.displayInfo['lutApplied'] = self.lutApplied
+        
     def __createDopplerCentroidCalculator(self, root):
         self.dopplerCentroidEstimates = self.__extractDopplerCentroidEstimates(root)
         self.__dopplerCentroidCalculator = DC.DopplerCentroidCalculator(self.dopplerCentroidEstimates)
@@ -336,9 +391,9 @@ class RCMLayer():
         
         #save the last element (which is the decimal part of the seconds) to a float
         try:
-            datetimeList[-1] = float(datetimeList[-1])*1e6  #the decimal part is optional so it may be None
+            datetimeList[-1] = float(datetimeList[-1])*1e6  # the decimal part is optional so it may be None
         except:
-            datetimeList[-1] = 0    #if exception is raised - probably due to no decimal seconds, set microseconds to zero
+            datetimeList[-1] = 0    # exception probably due to no decimal seconds, set microseconds to zero
             
         #now convert all elements to int (from string)
         datetimeList = list(map(int, datetimeList))
@@ -363,7 +418,7 @@ class RCMLayer():
             if not os.path.isfile(noise_xml):           # RCM NITF
                 noise_xml = os.path.join(os.path.dirname(self.productPath), "metadata", "calibration", noise_suffix)
                 if not os.path.isfile(noise_xml):
-                    print("Error: {} is not a valid file!".format(noise_xml))
+                    gvutils.error('{} is not a valid file!'.format(noise_xml))
                     return
             
             root = ET.parse(noise_xml).getroot()
@@ -402,7 +457,7 @@ class RCMLayer():
     
     def getBetaNoughtNoiseParams(self):
         '''returns a tuple (stepSize, values) where value is a list of noise levels.'''
-        #if it has already been read in, return the saved value
+        # if it has already been read in, return the saved value
         try:
             return self.betaNoughtNoiseParams
         except:
@@ -411,7 +466,7 @@ class RCMLayer():
         
     def getSigmaNoughtNoiseParams(self):
         '''returns a tuple (stepSize, values) where value is a list of noise levels.'''
-        #if it has already been read in, return the saved value
+        # if it has already been read in, return the saved value
         try:
             return self.sigmaNoughtNoiseParams
         except:
@@ -438,7 +493,7 @@ class RCMLayer():
         noise = []
         for band in range(self._ds.RasterCount):
             pixelFirstNoiseValue, stepSize, noiseValues = self.sigmaNoughtNoiseParams[band]
-            noise.append(interpolate_values(pixelFirstNoiseValue, stepSize, noiseValues, pixel))
+            noise.append(ATD_Utils.interpolate_values(pixelFirstNoiseValue, stepSize, noiseValues, pixel))
         
         if not self.azimuthNoiseParams:
             return noise
@@ -452,7 +507,7 @@ class RCMLayer():
                 stepSize = self.azimuthNoiseParams[band][0][1]      # Spotlight can have multi-bands, but only one beam 
                 noiseValues = self.azimuthNoiseParams[band][0][3]
                 lineFirstNoiseScalingValue = self.azimuthNoiseParams[band][0][4]
-                azimuth_scaling.append(interpolate_values(lineFirstNoiseScalingValue, stepSize, noiseValues, line))
+                azimuth_scaling.append(ATD_Utils.interpolate_values(lineFirstNoiseScalingValue, stepSize, noiseValues, line))
             #print 'spot', azimuth_scaling
         
         else:   # ScanSAR or High Resolution products has azimuthNoiseLevelScaling per band per burst
@@ -474,7 +529,7 @@ class RCMLayer():
                             # the trough of the azimuthNoiseLevelScaling is at the centre line of the bursts 
                             # The edges of the bursts are covered by adjacent ones, thus line_idx starts zero at the centre line, i.e., min azimuthNoiseLevelScaling
                             line_idx = (line - topMinLine) % burst_height - burst_height/2.
-                            azimuth_scaling.append(interpolate_values(-(numberOfNoiseLevelScalingValues-1)*stepSize/2., stepSize, noiseValues, line_idx))
+                            azimuth_scaling.append(ATD_Utils.interpolate_values(-(numberOfNoiseLevelScalingValues-1)*stepSize/2., stepSize, noiseValues, line_idx))
                             break
             #except:
             #    return noise    # skip adding azimuth_scaling when fails
@@ -485,38 +540,45 @@ class RCMLayer():
         '''Read a lookup table
         calib = 'Beta', 'Sigma', or 'Gamma'
         returns offset, gains where gains is a list of values for each pol in [HH, HV, VH, VV]
-        offset = [[offset_HH] [offset_HV] [offset_VH] [offset_VV]]
-        gains = [[gains_HH ...] [gains_HV ...] [gains_VH ...] [gains_VV ...]]
+        offset = [offset1, offset2, offset3, offset4]
+        gains = [[gains_1 ...] [gains_2 ...] [gains_2 ...] [gains_2 ...]]
         '''
         # Setup blank arrays
-        offset = numpy.empty((len(self.pols), 1), numpy.float32)
-        gains = numpy.empty((len(self.pols), self.xsize), numpy.float32)
+        #offset = numpy.empty((len(self.pols), 1), numpy.float32)
+        #gains = numpy.empty((len(self.pols), self.xsize), numpy.float32)
+        offset = []
+        gains = []
         
-        # Assemble the gains and offsets for all polarisations
-        for pol_idx, pol in enumerate(self.pols):
+        # read in gains and offsets
+        for pol in self.pols:
             lut_suffix = "lut" + calib + "_" + pol + ".xml"
             lutFile = os.path.join(self.productPath, "calibration", lut_suffix)  # RCM product.xml
             if not os.path.isfile(lutFile):     # RCM NITF
                 lutFile = os.path.join(os.path.dirname(self.productPath), "metadata", "calibration", lut_suffix)
                 if not os.path.isfile(lutFile):
-                    print("Error: {} is not a valid file!".format(lutFile))
+                    gvutils.error('{} is not a valid file!'.format(lutFile))
                     return
             
             root = ET.parse(lutFile).getroot()
-
             pixelFirstLutValue = int([i.text for i in root.iter(SCHEMA + "pixelFirstLutValue")][0])
-            stepSize = float([i.text for i in root.iter(SCHEMA + "stepSize")][0])
-            offset[pol_idx] = float([i.text for i in root.iter(SCHEMA + "offset")][0])
-            gg = [i.text for i in root.iter(SCHEMA + "gains")][0].split()
-            gg = list(map(float, gg))
+            stepSize = [i.text for i in root.iter(SCHEMA + "stepSize")][0]
+            offset.append(float([i.text for i in root.iter(SCHEMA + "offset")][0]))
+            gg = list(map(float, [i.text for i in root.iter(SCHEMA + "gains")][0].split()))
             
-            gains[pol_idx] = interpolate_values(pixelFirstLutValue, stepSize, gg, numpy.arange(self.xsize), 'quadratic')
-        
+            if stepSize == '1':
+                gains.append(gg)
+            elif stepSize == '-1':
+                gg.reverse()
+                gains.append(gg)
+            else:
+                #print('gg={}'.format(gg[:15]))
+                gains_interpolate = ATD_Utils.interpolate_values(pixelFirstLutValue, float(stepSize), gg, numpy.arange(self.xsize), 'linear')
+                gains.append(gains_interpolate)
         return offset, gains
 
     def getBetaNoughtLUT(self):
-        '''returns a tuple (offset, gains) where gains is an array.'''
-        #if it has already been read in, return the saved value
+        '''returns offset, gains where gains contain an array for each band.'''
+        # if it has already been read in, return the saved value
         try:
             return self.betaNoughtLUT
         except:
@@ -524,29 +586,29 @@ class RCMLayer():
             return self.betaNoughtLUT
     
     def getSigmaNoughtLUT(self):
-        '''returns a tuple (offset, gains) where gains is an array.'''
+        '''returns offset, gains where gains contain an array for each band.'''
         #if it has already been read in, return the saved value
         try:
             return self.sigmaNoughtLUT
         except:
-            # return LUT for all bands      
+            # return LUT for all bands
             self.sigmaNoughtLUT = self._readLUT('Sigma')
             return self.sigmaNoughtLUT
         
     def getGammaLUT(self):
-        '''returns a tuple (offset, gains) where gains is an array.'''
-        #if it has already been read in, return the saved value
+        '''returns offset, gains where gains contain an array for each band.'''
+        # if it has already been read in, return the saved value
         try:
             return self.gammaLUT
         except:
             self.gammaLUT = self._readLUT('Gamma')
             return self.gammaLUT
     
-    def __applyLUT(self, calib, extents, band=None, data=None, oversample=False, SLCProductType=0):
+    def __applyLUT(self, extents, calib, band=None, data=None, oversample=False, SLCProductType=0):
         '''Returns an array of calibrated values for the given extents.  
-        extents is a tuple (startPixel, startLine, nPixels, nLines)
-        offset and gains are from the desired lookup table to apply.
-        Uses data as raw dn if given, otherwise reads from the dataset.
+        extents is a tuple: (startPixel, startLine, nPixels, nLines)
+        offset and gains are from the desired lookup table.
+        Uses data as raw DN if given, otherwise reads from the dataset.
         If data is None, all bands will be read unless band is specified.
         If data is not None, band parameter is ignored.'''
         
@@ -555,26 +617,44 @@ class RCMLayer():
         # if SLCProductType = 1, returns ComplexScatter = (DN/LUT)
         # if SLCProductType = 2, returns ComplexSigma = (DN^2/LUT^2)
         
-        startPixel, startLine, nPixels, nLines = extents
-        
+        # offset = [offset1, offset2, offset3, offset4]
+        # gains  = [[gains_1 ], [gains_2 ], [gains_3 ], [gains_4 ]]
         if calib == 'Sigma':
             offset, gains = self.getSigmaNoughtLUT()
         elif calib == 'Beta':
             offset, gains = self.getBetaNoughtLUT()
         elif calib == 'Gamma':
             offset, gains = self.getGammaLUT()
-        #print '\nLUT gains =', gains[:,startPixel:startPixel+nPixels]
-        # offset = [[offset1] [offset2] [offset3] [offset4]]
-        # gains = [[gains_band1 ...], [gains_band2 ...], [gains_band3 ...], [gains_band4 ...]]
         
-        #read in data if not given
+        # convert as numpy.array floats
+        gains = numpy.asarray(gains).astype(numpy.float64)
+
+        startPixel, startLine, nPixels, nLines = extents
+        
+        # read in data if not given
         if data is None:
-            if isinstance(band, int) and band > 0:    #getting just a single band, band ranges from 1 to 4
+            if isinstance(band, int) and band > 0:    # get just a single band, band ranges from 1 to 4
                 data = self._ds.GetRasterBand(band).ReadAsArray(*extents)
             else:
                 data = self._ds.ReadAsArray(*extents)
-            
-        # need more precision for calculation, whether to convert to real array depends on SLCProductType parameter
+
+        # perform the error check for given band and data 
+        # add by Shawnn Gong on May 29, 2022
+        if isinstance(band, int) and band > 0 and data.ndim == 3:
+            raise ValueError("a single RCM band is specified, but 'data' contains multiple bands!")
+        if band is None:
+            if data.ndim == 3 and data.shape[0] != self._ds.RasterCount:
+                raise ValueError("'data' does not contain all bands.")
+            if data.ndim == 2 and self._ds.RasterCount > 1:
+                msg = " ** 'data' is given as a single band array, but this RCM is a multi-band image.\n"
+                msg += " ** Therefore we can't determine which LUT[band] to apply, exit!"
+                raise ValueError(msg)
+        
+        if oversample:
+            import SARSpectrumAnalysis
+            data = SARSpectrumAnalysis.oversample(self, startPixel, startPixel+nPixels, startLine, startLine+nLines, image_array=data, nonComplexOK=True)
+        
+        # more precision array, whether to convert to real array depends on SLCProductType parameter
         if numpy.iscomplexobj(data):
             if SLCProductType > 0:
                 data = data.astype(numpy.complex128)
@@ -584,68 +664,65 @@ class RCMLayer():
         else:
             data = data.astype(numpy.float64)
         
-        if isinstance(band, int) and band > 0:    # a single band (from 1 to 4) is read in
+        if isinstance(band, int) and band > 0:    # read a single band (between 1 and 4)
             # extract the part of the lookup table that is needed
-            gg = gains[band-1][startPixel:startPixel+nPixels]
-            # if oversample, interpolate the LUT to fit
-            if oversample or data.shape[-1] != len(gg):
-                gg = numpy.interp(numpy.linspace(0, len(gg)-1, num=data.shape[-1]), list(range(len(gg))), gg)
+            LUT = gains[band-1][startPixel:startPixel+nPixels]
+            if oversample or data.shape[-1] != len(LUT):
+                # if oversample, interpolate the LUT
+                LUT = numpy.interp(numpy.linspace(0, len(LUT)-1, num=data.shape[-1]), list(range(len(LUT))), LUT)
             
             if self.isComplex:
                 if SLCProductType == 1:     # ComplexScatter
-                    data /= gg
+                    data /= LUT
                 else:
-                    #calibrated_values = data**2 / gains**2
-                    #the above line is correct but doing it in steps as below will allow numpy to perform in-place operations
-                    #this can save a lot of memory that would be wasted in an unnecessary copy - especially for a large image chip
+                    #calibrated_values = data**2 / LUT**2
+                    # The above line is correct but doing it in steps as below will allow numpy to perform in-place operations. This can save a lot of memory that would be wasted in an unnecessary copy - especially for a large image chip
                     data **= 2
-                    data /= gg**2
+                    LUT **= 2
+                    data /= LUT
             else:
-                #calibrated_values = (data**2 + offset) / gains
-                #the above line is correct but doing it in steps as below will allow numpy to perform in-place operations
-                #this can save a lot of memory that would be wasted in an unnecessary copy - especially for a large image chip
+                #calibrated_values = (data**2 + offset) / LUT
+                # The above line is correct but doing it in steps as below will allow numpy to perform in-place operations. This can save a lot of memory that would be wasted in an unnecessary copy - especially for a large image chip
                 data **= 2
-                data += offset[band-1][0]
-                data /= gg
-#            print 'per band #', band, data.shape
-#            print data
+                data += offset[band-1]
+                data /= LUT
         else:           # all bands read in
-            if self._ds.RasterCount == 1:   # data.shape = (row, col)
-                gg = gains[0][startPixel:startPixel+nPixels]
-                # if oversample, interpolate the LUT to fit
-                if oversample or data.shape[-1] != len(gg):
-                    gg = numpy.interp(numpy.linspace(0, len(gg)-1, num=data.shape[-1]), list(range(len(gg))), gg)
+            if self._ds.RasterCount == 1:   # single-band: data.shape = (row, col)
+                LUT = gains[0][startPixel:startPixel+nPixels]
+                if oversample or data.shape[-1] != len(LUT):
+                    # if oversample, interpolate the LUT
+                    LUT = numpy.interp(numpy.linspace(0, len(LUT)-1, num=data.shape[-1]), list(range(len(LUT))), LUT)
                 
                 if self.isComplex:
                     if SLCProductType == 1:     # ComplexScatter
-                        data /= gg
+                        data /= LUT
                     else:
                         data **= 2
-                        data /= gg**2
+                        LUT **= 2
+                        data /= LUT
                 else:
                     data **= 2
-                    data += offset[0][0]
-                    data /= gg
-#                print 'single band', data.shape
-#                print data
-            else:                           # data.shape = (band, row, col)
-                for band_idx in range(self._ds.RasterCount):
-                    gg = gains[band_idx, startPixel:startPixel+nPixels]
-                    # if oversample, interpolate the LUT to fit
-                    if oversample or data.shape[-1] != len(gg):
-                        gg = numpy.interp(numpy.linspace(0, len(gg)-1, num=data.shape[-1]), list(range(len(gg))), gg)
+                    data += offset[0]
+                    data /= LUT
+            else:                           # multi-band: data.shape = (band, row, col)
+                for idx in range(self._ds.RasterCount):
+                    LUT = gains[idx][startPixel:startPixel+nPixels]
+                    if oversample or data.shape[-1] != len(LUT):
+                        # if oversample, interpolate the LUT
+                        LUT = numpy.interp(numpy.linspace(0, len(LUT)-1, num=data.shape[-1]), list(range(len(LUT))), LUT)
                     
                     if self.isComplex:
                         if SLCProductType == 1:
-                            data[band_idx] /= gg
+                            data[idx] /= LUT
                         else:
-                            data[band_idx] **= 2
-                            data[band_idx] /= gg**2
+                            data[idx] **= 2
+                            LUT **= 2
+                            data[idx] /= LUT
                     else:
-                        data[band_idx] **= 2
-                        data[band_idx] += offset[band_idx][0]
-                        data[band_idx] /= gg
-                #print 'sigma =', data
+                        data[idx] **= 2
+                        data[idx] += offset[idx]
+                        data[idx] /= LUT
+
         return data
     
     def getBetaNought(self, extents, band=None, data=None):     # band from 1 to 4
@@ -655,7 +732,7 @@ class RCMLayer():
         If data is None, all bands will be read unless band is specified.
         If data is not None, band parameter is ignored.'''
         
-        return self.__applyLUT('Beta', extents, band=band, data=data)        
+        return self.__applyLUT(extents, 'Beta', band=band, data=data)
     
     def getSigmaNought(self, extents, band=None, data=None, oversample=False):     # band from 1 to 4
         '''Returns an array of sigma nought calibrated values for the given extents.  
@@ -664,19 +741,19 @@ class RCMLayer():
         If data is None, all bands will be read unless band is specified.
         If data is not None, band parameter is ignored.'''
         
-        return self.__applyLUT('Sigma', extents, band=band, data=data, oversample=oversample)
+        return self.__applyLUT(extents, 'Sigma', band=band, data=data, oversample=oversample)
     
     def getSigmaNoughtComplexScatter(self, extents, band=None, data=None, oversample=False):
         ''' This is for DRDC usage
         returns ComplexScatter = (DN/LUT) '''
         
-        return self.__applyLUT('Sigma', extents, band=band, data=data, oversample=oversample, SLCProductType=1)
+        return self.__applyLUT(extents, 'Sigma', band=band, data=data, oversample=oversample, SLCProductType=1)
     
     def getComplexSigmaNought(self, extents, band=None, data=None, oversample=False):
         ''' This is for DRDC usage
         returns ComplexSigma = (DN^2/LUT^2) '''
         
-        return self.__applyLUT('Sigma', extents, band=band, data=data, oversample=oversample, SLCProductType=2)
+        return self.__applyLUT(extents, 'Sigma', band=band, data=data, oversample=oversample, SLCProductType=2)
     
     def getGamma(self, extents, band=None, data=None):     # band from 1 to 4
         '''Returns an array of gamma calibrated values for the given extents.  
@@ -685,8 +762,56 @@ class RCMLayer():
         If data is None, all bands will be read unless band is specified.
         If data is not None, band parameter is ignored.'''
         
-        return self.__applyLUT('Gamma', extents, band=band, data=data)
+        return self.__applyLUT(extents, 'Gamma', band=band, data=data)
         
+    def old_getSigmaNoughtComplexScatter(self, extents, band=None, data=None, oversample=False):     # band from 1 to 4
+        '''Returns an array of Sigma Nought Complex Scatter for SLC.'''
+        
+        startPixel, startLine, nPixels, nLines = extents
+        
+        offset, gains = self.getSigmaNoughtLUT()
+        gains = numpy.array(gains)
+        
+        #read in data if not given
+        if data is None:
+            if isinstance(band, int) and band > 0:    # get just a single band, band ranges from 1 to 4
+                data = self._ds.GetRasterBand(band).ReadAsArray(*extents)
+            else:
+                data = self._ds.ReadAsArray(*extents)
+            
+        if numpy.iscomplexobj(data):
+            data = data.astype(numpy.complex128)
+        else:
+            data = data.astype(numpy.float64)
+        
+        if oversample:
+            import SARSpectrumAnalysis
+            data = SARSpectrumAnalysis.oversample(self, startPixel, startPixel+nPixels, startLine, startLine+nLines, image_array=data, nonComplexOK=True)
+        
+        if band:        # single band from 1 to 4
+            gg = gains[band-1][startPixel:startPixel+nPixels]
+            if oversample or data.shape[-1] != len(gg):
+                gg = numpy.interp(numpy.linspace(0, len(gg)-1, num=data.shape[-1]), list(range(len(gg))), gg)
+
+            data /= gg
+        else:           # for all bands
+            if self._ds.RasterCount == 1:   # data.shape = (row, col)
+                gg = gains[0][startPixel:startPixel+nPixels]
+                # if oversample, interpolate the LUT to fit
+                if oversample or data.shape[-1] != len(gg):
+                    gg = numpy.interp(numpy.linspace(0, len(gg)-1, num=data.shape[-1]), list(range(len(gg))), gg)
+                
+                data /= gg
+            else:                           # data.shape = (band, row, col)
+                for band_idx in range(self._ds.RasterCount):
+                    gg = gains[band_idx, startPixel:startPixel+nPixels]
+                    # if oversample, interpolate the LUT to fit
+                    if oversample or data.shape[-1] != len(gg):
+                        gg = numpy.interp(numpy.linspace(0, len(gg)-1, num=data.shape[-1]), list(range(len(gg))), gg)
+                    
+                    data[band_idx] /= gg
+        return data
+    
     def isScanSAR(self):
         return ("SC" in self.beamModeMnemonic and "RGSC" not in self.beamModeMnemonic)
     
@@ -698,20 +823,26 @@ class RCMLayer():
     
     def _calcIncAngles(self):
         '''Returns the incidence angles in degrees for all pixels.'''
-        inc_ang_file = os.path.join(self.productPath, "calibration", "incidenceAngles.xml")  # RCM product.xml
-        if not os.path.isfile(inc_ang_file):        # RCM NITF
+        inc_ang_file = os.path.join(self.productPath, "calibration", "incidenceAngles.xml")
+        if not os.path.isfile(inc_ang_file):        # RCM NITF case
             inc_ang_file = os.path.join(os.path.dirname(self.productPath), "metadata", "calibration", "incidenceAngles.xml")
             if not os.path.isfile(inc_ang_file):
-                print("Error: {} is not a valid file!".format(inc_ang_file))
+                gvutils.error('{} is not a valid file!'.format(inc_ang_file))
                 return
         
         root = ET.parse(inc_ang_file).getroot()
-
         pixelFirstAnglesValue = int([i.text for i in root.iter(SCHEMA + "pixelFirstAnglesValue")][0])
-        stepSize = float([i.text for i in root.iter(SCHEMA + "stepSize")][0])
+        stepSize = [i.text for i in root.iter(SCHEMA + "stepSize")][0]
         angles = list(map(float, [i.text for i in root.iter(SCHEMA + "angles")]))
         
-        self.incidenceAngles = interpolate_values(pixelFirstAnglesValue, stepSize, angles, numpy.arange(self.xsize), 'quadratic')
+        if stepSize == '1':
+            self.incidenceAngles = angles
+        elif stepSize == '-1':
+            angles.reverse()
+            self.incidenceAngles = angles
+        else:
+            stepSize = float(stepSize)
+            self.incidenceAngles = ATD_Utils.interpolate_values(pixelFirstAnglesValue, stepSize, angles, numpy.arange(self.xsize), 'linear')
     
     def getIncidenceAngle(self, pixel, line=0):
         '''Returns an incidence angle in degrees at a pixel location.'''
@@ -734,6 +865,15 @@ class RCMLayer():
                 bottomRightPixel = int([i.text for i in node.iter(SCHEMA + "bottomRightPixel")][0])
                 #print topLeftLine, topLeftPixel, bottomRightLine, bottomRightPixel
                 #print (pixel-bottomRightPixel)*(pixel-topLeftPixel), (line-bottomRightLine)*(line-topLeftLine)
+                if (pixel-bottomRightPixel)*(pixel-topLeftPixel) <= 0 and (line-bottomRightLine)*(line-topLeftLine) <= 0:
+                    return int(node.attrib['burst'])
+        elif self.mlc_ScanSAR:
+            node_1 = root.findall(".//" + SCHEMA + "mlcBurstMap")[0]
+            for node in node_1.iter(SCHEMA + "burstAttributes"):
+                topLeftLine = int([i.text for i in node.iter(SCHEMA + "topLeftLine")][0])
+                topLeftPixel = int([i.text for i in node.iter(SCHEMA + "topLeftPixel")][0])
+                bottomRightLine = int([i.text for i in node.iter(SCHEMA + "bottomRightLine")][0])
+                bottomRightPixel = int([i.text for i in node.iter(SCHEMA + "bottomRightPixel")][0])
                 if (pixel-bottomRightPixel)*(pixel-topLeftPixel) <= 0 and (line-bottomRightLine)*(line-topLeftLine) <= 0:
                     return int(node.attrib['burst'])
         elif self.slc_ScanSAR:
@@ -764,12 +904,16 @@ class RCMLayer():
                 return reftime, coefficients
     
     def readBurstAttributes(self):
-        self.slc_ScanSAR = self.grd_ScanSAR = False
+        self.slc_ScanSAR = False
+        self.grd_ScanSAR = False
+        self.mlc_ScanSAR = False
         
         if self.xmlLines.find('slcBurstMap') > -1:
             self.slc_ScanSAR = True
         elif self.xmlLines.find('grdBurstMap') > -1:
             self.grd_ScanSAR = True
+        elif self.xmlLines.find('mlcBurstMap') > -1:
+            self.mlc_ScanSAR = True
         else:
             self.bursts = None
             self.burst_pts_lon_lat = None
@@ -821,8 +965,12 @@ class RCMLayer():
                     self.bursts[beam][3] = bottomRightLine
                     self.bursts[beam][2] = bottomRightPixel
         
-        elif self.grd_ScanSAR:
-            node_1 = root.findall(".//" + SCHEMA + "grdBurstMap")[0]     # just get the first pole in case there are more than 1
+        elif self.grd_ScanSAR or self.mlc_ScanSAR:
+            if self.grd_ScanSAR:
+                node_1 = root.findall(".//" + SCHEMA + "grdBurstMap")[0]     # just get the first pole in case there are more than 1
+            elif self.mlc_ScanSAR:
+                node_1 = root.findall(".//" + SCHEMA + "mlcBurstMap")[0]     # just get the first pole in case there are more than 1
+            
             self.numberBursts = int([i.text for i in node_1.iter(SCHEMA + "numberOfEntries")][0])
             self.numberBurstCycles = self.numberBursts/self.numberOfBeams
             
@@ -846,7 +994,7 @@ class RCMLayer():
                 ll.extend(self.pixel_to_view(topLeftPixel, topLeftLine))
                 self.burst_pts_lon_lat.append(ll)
                 
-                #if the current node contains data closer to the top or bottom, replace the topPixel or bottomPixel values
+                # if the current node contains data closer to the top or bottom, replace the topPixel or bottomPixel values
                 if topLeftLine < self.bursts[beam][1]:
                     self.bursts[beam][1] = topLeftLine
                     self.bursts[beam][0] = topLeftPixel
@@ -871,7 +1019,7 @@ class RCMLayer():
                 tops.append([topMinPixel, topMinLine])
                 bottoms.append([bottomMaxPixel, bottomMaxLine])
             
-            self.burst_bin_tops = [[], []]
+            self.burst_bin_tops = [[], []]  #[[beams], [left most pixel#]] sorted from left to right
             for beam, top in zip(beams, tops):
                 self.burst_bin_tops[0].append(beam)
                 self.burst_bin_tops[1].append(top[0])
@@ -881,15 +1029,14 @@ class RCMLayer():
                 self.burst_bin_tops[0].reverse()
                 self.burst_bin_tops[1].reverse()
             
-            # set left edges to 0
+            # set left edge pixel# to 0
             self.burst_bin_tops[1][0] = 0
             
-            return beams, tops, bottoms     # tops and bottoms are sorted from low to high
+            return beams, tops, bottoms     # tops and bottoms are sorted from left to right (0 to nSamples)
     
     def getBeam(self, pixel, line=None):
-        if pixel <0 or pixel >= self.nSamples:
-            #print('Error getBeam for pixel {}'.format(pixel))
-            return
+        pixel = max(pixel, 0)
+        pixel = min(self.nSamples-1, pixel)
         
         if self.numberOfBeams == 1:
             return self.beams[0]    # single beam
@@ -906,18 +1053,18 @@ class RCMLayer():
         beam = self.getBeam(pixel)
         if not beam: return
         
-        prf = self.PRF[beam]     #assuming the PRF list is in order of increasing incidence angle
+        prf = self.PRF[beam]     # assuming the PRF list is in order of increasing incidence angle
 
         #account for other factors that can impact the effective PRF
         if effectivePerChannelPRF:
             if self.tx_dualPol:
-                prf /= 2.    #per-channel PRF is half of system PRF when 2 polarizations are transmitting alternately 
+                prf /= 2.    # per-channel PRF is half of system PRF when 2 polarizations are transmitting alternately 
             
-            #PRF is effectively increased by the number of receive antennas
-            #this seems to be correct for oversampling ultrafine products but
-            #not for azimuth ambiguity marking.  Oversampling now just gets the 
-            #effective PRF by taking nLines/(endTime-startTime),
-            #so remove the adjustment here.
+            # PRF is effectively increased by the number of receive antennas
+            # this seems to be correct for oversampling ultrafine products but
+            # not for azimuth ambiguity marking.  Oversampling now just gets the
+            # effective PRF by taking nLines/(endTime-startTime),
+            # so remove the adjustment here.
             #prf *= self.nRecieveAntennas
             
         return prf
@@ -933,11 +1080,11 @@ class RCMLayer():
         if not self.isInZeroDopplerCoords():
             raise RuntimeError('getTime( ) does not support geocoded products.')
 
-        #just do a linear interpolation between the first and last zero doppler azimuth times
+        # just do a linear interpolation between the first and last zero doppler azimuth times
         def total_seconds(td):
             return td.days*24*3600 + td.seconds + td.microseconds/10.0**6
             
-        #get the timedelta - this may be negative if the line order has been reversed
+        # get the timedelta - this may be negative if the line order has been reversed
         td = total_seconds(self.zeroDopplerTimeLastLine - self.zeroDopplerTimeFirstLine)
         
         return self.zeroDopplerTimeFirstLine + datetime.timedelta(seconds=line*td/self.nLines)
@@ -947,7 +1094,7 @@ class RCMLayer():
         
         azimuthTime = self.getTime(pixel, line)
         slantRangeDistance = self.getSlantRange(pixel, line)
-        slantRangeTime = 2*slantRangeDistance/scipy.constants.c #round trip (2 way) slant range time
+        slantRangeTime = 2. * slantRangeDistance/scipy.constants.c  # round trip (2 way) slant range time
         
         dopplerCentroid = self.__dopplerCentroidCalculator.getDopplerCentroid(azimuthTime, slantRangeTime)
         
@@ -955,17 +1102,16 @@ class RCMLayer():
         if self.isSpotlight():
             # same polynomial for doppler centroid and doppler rate
             params = self.getDopplerRateParams(pixel, line)
-            #print params
             doppler_rate = self.__evalDopplerCentroid(slantRangeTime, params[0], params[1])
             
-            #get total seconds from the doppler centroid estimate time
+            # get total seconds from the doppler centroid estimate time
             def total_seconds(td):
                 return td.days*24*3600 + td.seconds + td.microseconds/10.0**6
             ref = self.dopplerCentroidEstimates[0].azimuthTime
             dt = total_seconds(azimuthTime-ref)
 
-            #the doppler rate should be Hz/s
-            #calculate the doppler centroid offset
+            # the doppler rate should be Hz/s
+            # calculate the doppler centroid offset
             dc_offset = dt*doppler_rate
         else:
             dc_offset = 0
@@ -1000,21 +1146,18 @@ class RCMLayer():
     
     def getGroundRange(self, pixel):
         if self.firstPixelIsNearRange():
-            return pixel*self.getPixelSpacing()
+            return pixel*self.pixelSpacing
         else:
-            return (self.nSamples-pixel)*self.getPixelSpacing()
-    
-    def getPixelSpacing(self):
-        return self.pixelSpacing
+            return (self.nSamples-pixel)*self.pixelSpacing
     
     def getGroundPixelSpacing(self, pt=None):
         if not self.isInSlantRange():
             return self.pixelSpacing
         else:
-            if not pt:
-                inc_angle = (self.incAngleNear + self.incAngleFar)/2
-            else:
+            if isinstance(pt, list) and len(pt) >= 2:
                 inc_angle = self.getIncidenceAngle(pt[0], pt[1])
+            else:
+                inc_angle = (self.incAngleNear + self.incAngleFar)/2
             return self.pixelSpacing/math.sin(math.radians(inc_angle))
     
     def firstPixelIsNearRange(self):
@@ -1038,9 +1181,9 @@ class RCMLayer():
         """ calculate the satellite track angle on sphere surface using
         near-range's first_line/last_line lat/long pairs """
         
-        # Note by Shawn Gong in Jul 2015: remove gdal.Transformer() 
+        # Note by Shawn Gong in Jul 2015: remove gdal.Transformer()
         #   because it fails when cross antemeridian
-        # It is replaced by OpenEV's pixel_to_view() 
+        # It is replaced by OpenEV's pixel_to_view()
         #   where cross antemeridian case has been updated in gvraster.c
         if pixel is None:
             try:
@@ -1065,10 +1208,10 @@ class RCMLayer():
             firstline_lat, lastline_lat = lastline_lat, firstline_lat
             
         d = math.cos(math.radians((firstline_lat+lastline_lat)/2))
-        xx=(lastline_lon-firstline_lon)*d
-        yy=lastline_lat-firstline_lat
+        xx = (lastline_lon-firstline_lon)*d
+        yy = lastline_lat-firstline_lat
 
-        return math.fmod((450.-math.degrees(math.atan2(yy,xx))), 360.)
+        return math.fmod((450.-math.degrees(math.atan2(yy, xx))), 360.)
 
     def isInZeroDopplerCoords(self):
         '''test whether the product is in zero doppler coordinates 
@@ -1108,24 +1251,13 @@ class RCMLayer():
         try:
             return self._ds.GetRasterBand(gdal_band_idx).GetMetadata()['POLARIMETRIC_INTERP']
         except KeyError:
-            return 'Band '+str(gdal_band_idx)
+            return SARLayer.getBandLabel(self, gdal_band_idx)
 
     def getOrbitRate(self):
         return ORBIT_RATE
 
     def getOrbitInclination(self):
-        return ORBIT_INC
+        return ORBIT_INCLINATION
 
-def interpolate_values(firstValue, stepSize, values, xnew, kind='cubic'):
-    """
-    Interpolate the calibration values to obtain one value per sample.
-    Same routine used for noise level interpolation.
-    """
-    from scipy import interpolate
-    
-    # sample index
-    x_index = numpy.arange(len(values)) * stepSize + firstValue
-    interp_function = interpolate.interp1d(x_index, numpy.array(values).astype(numpy.float64), kind=kind, fill_value="extrapolate")
 
-    return interp_function(xnew)      # returns an array
-
+register(GDAL_DRIVER_SHORT_NAME, RCMLayer, openSubDatasets=False, handleVRT=True)
