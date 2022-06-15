@@ -1,14 +1,12 @@
 /******************************************************************************
 *
-* Project:  DRDC Ottawa GEOINT
+* Project:  DRDC Ottawa, Support for GEOINT and Geomatics with RCM data
 * Purpose:  Radarsat Constellation Mission - XML Products (product.xml) driver
-* Author:   Roberto Caron, MDA
+* Author:   Roberto Caron, Shawn Gong, MDA
 *           on behalf of DRDC Ottawa
 *
 ******************************************************************************
-* Copyright (c) 2020, DRDC Ottawa
-*
-* Based on the RS2 Dataset Class
+* Copyright (c) Her Majesty the Queen in Right of Canada (Department of National Defence), 2022
 *
 * Permission is hereby granted, free of charge, to any person obtaining a
 * copy of this software and associated documentation files (the "Software"),
@@ -420,7 +418,7 @@ void RCMCalibRasterBand::ReadLUT() {
 
 	char bandNumber[6];
 	//itoa(poDS->GetRasterCount() + 1, bandNumber, 10);
-	sprintf(bandNumber, "%s", poDS->GetRasterCount()+1);
+	sprintf(bandNumber, "%d", poDS->GetRasterCount()+1);
 
 	CPLXMLNode *psLUT = CPLParseXMLFile(m_pszLUTFile);
 
@@ -526,7 +524,7 @@ void RCMCalibRasterBand::ReadNoiseLevels() {
 
 	char bandNumber[6];
 	//itoa(poDS->GetRasterCount() + 1, bandNumber, 10);
-	sprintf(bandNumber, "%s", poDS->GetRasterCount()+1);
+	sprintf(bandNumber, "%d", poDS->GetRasterCount()+1);
 
 	CPLXMLNode *psNoiseLevels = CPLParseXMLFile(this->m_pszNoiseLevelsFile);
 
@@ -754,7 +752,7 @@ void RCMCalibRasterBand::SetPartialLUT(int pixel_offset, int pixel_width)
 
 			char bandNumber[6];
 			//itoa(this->GetBand(), bandNumber, 10);
-			sprintf(bandNumber, "%s", this->GetBand());
+			sprintf(bandNumber, "%d", this->GetBand());
 
 			poDS->SetMetadataItem(CPLString("LUT_GAINS_").append(bandNumber).c_str(), lut_gains);
 			// Can free this because the function SetMetadataItem takes a copy
@@ -1603,7 +1601,22 @@ GDALDataset *RCMDataset::Open(GDALOpenInfo * poOpenInfo)
 	poDS->SetMetadataItem("SAMPLED_LINE_SPACING_TIME", pszSampledLineSpacingTime);
 
 	GDALDataType eDataType;
-	if (EQUAL(pszSampleDataType, "Complex"))
+
+	if (EQUAL(pszSampleDataType, "Mixed"))      /* RCM MLC has Mixed sampleType */
+	{
+		poDS->isComplexData = false;            /* RCM MLC is detected, non-complex */
+		if (nBitsPerSample == 32)
+		{
+			eDataType = GDT_Float32; /* 32 bits, check read block */
+            poDS->magnitudeBits = 32;
+		}
+		else
+		{
+			eDataType = GDT_UInt16; /* 16 bits, check read block */
+            poDS->magnitudeBits = 16;
+		}
+	}
+	else if (EQUAL(pszSampleDataType, "Complex"))
 	{
 		poDS->isComplexData = true;
 		/* Usually this is the same bits for both */
@@ -1753,7 +1766,7 @@ GDALDataset *RCMDataset::Open(GDALOpenInfo * poOpenInfo)
 			continue;
 
 		/* -------------------------------------------------------------------- */
-		/*      Fetch ipdf image. COuld be either tif or ntf.                   */
+		/*      Fetch ipdf image. Could be either tif or ntf.                   */
 		/*      Replace / by \\                                                 */
 		/* -------------------------------------------------------------------- */
 		const char *pszBasedFilename = CPLGetXMLValue(psNode, "", "");
@@ -1779,9 +1792,17 @@ GDALDataset *RCMDataset::Open(GDALOpenInfo * poOpenInfo)
 		else {
 			/* Keep adding polarizations filename according to the pole */
 			const char *pszPole = CPLGetXMLValue(psNode, "pole", "");
-			if (*pszPole == '\0')
-				/* Overhere, when no pole has been set but it is NOT a NTF, skip it */
+			if (*pszPole == '\0') {
+				/* Guard against case when pole is a null string, skip it */
+				imageBandFileCount--;
 				continue;
+			}
+
+			if (EQUAL(pszPole, "XC")) {
+				/* Skip RCM MLC's 3rd band file ##XC.tif */
+				imageBandFileCount--;
+				continue;
+			}
 			
 			imageBandList.AddString(CPLString(pszPole).toupper());
 			imageBandFileList.AddString(pszBasedFilename);
@@ -1872,6 +1893,10 @@ GDALDataset *RCMDataset::Open(GDALOpenInfo * poOpenInfo)
 				if (*pszPoleToMatch == '\0')
 					continue;
 
+				if (EQUAL(pszPoleToMatch, "XC"))
+					/* Skip noise for RCM MLC's 3rd band XC */
+					continue;
+
 				if (EQUAL(pszNoiseLevelFile, ""))
 					continue;
 
@@ -1920,6 +1945,10 @@ GDALDataset *RCMDataset::Open(GDALOpenInfo * poOpenInfo)
 				const char *pszLUTFile = CPLGetXMLValue(psRefNode, "", "");
 
 				if (*pszPoleToMatch == '\0')
+					continue;
+
+				if (EQUAL(pszPoleToMatch, "XC"))
+					/* Skip Calib for RCM MLC's 3rd band XC */
 					continue;
 
 				if (*pszLUTType == '\0')
